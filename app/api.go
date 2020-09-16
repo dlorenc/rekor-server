@@ -21,67 +21,31 @@ package app
 // curl http://localhost:3000/add -F "fileupload=@/tmp/file" -vvv
 
 import (
-	"context"
+	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
 	"github.com/google/trillian"
 	"github.com/projectrekor/rekor-server/logging"
-	"github.com/spf13/viper"
+	"github.com/projectrekor/rekor-server/pkg"
 )
 
 type API struct {
-	tLogID    int64
-	logClient trillian.TrillianLogClient
-	mapClient trillian.TrillianMapClient
+	clients *pkg.Clients
 }
 
 func NewAPI() (*API, error) {
-	logRpcServer := fmt.Sprintf("%s:%d",
-		viper.GetString("trillian_log_server.address"),
-		viper.GetInt("trillian_log_server.port"))
-	ctx := context.Background()
-	tConn, err := dial(ctx, logRpcServer)
+	clients, err := pkg.NewClients()
 	if err != nil {
 		return nil, err
-	}
-	logAdminClient := trillian.NewTrillianAdminClient(tConn)
-	logClient := trillian.NewTrillianLogClient(tConn)
-
-	tLogID := viper.GetInt64("trillian_log_server.tlog_id")
-	if tLogID == 0 {
-		t, err := createAndInitTree(ctx, logAdminClient, logClient)
-		if err != nil {
-			return nil, err
-		}
-		tLogID = t.TreeId
-	}
-
-	mapRpcServer := fmt.Sprintf("%s:%d",
-		viper.GetString("trillian_map_server.address"),
-		viper.GetInt("trillian_map_server.port"))
-	mConn, err := dial(ctx, mapRpcServer)
-	if err != nil {
-		return nil, err
-	}
-	mapAdminClient := trillian.NewTrillianAdminClient(mConn)
-	mapClient := trillian.NewTrillianMapClient(mConn)
-	tMapID := viper.GetInt64("trillian_map_server.tmap_id")
-	if tMapID == 0 {
-		t, err := createAndInitMap(ctx, mapAdminClient, mapClient)
-		if err != nil {
-			return nil, err
-		}
-		tMapID = t.TreeId
 	}
 
 	return &API{
-		tLogID:    tLogID,
-		logClient: logClient,
-		mapClient: mapClient,
+		clients: clients,
 	}, nil
 }
 
@@ -108,14 +72,47 @@ func (api *API) getHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	server := serverInstance(api.logClient, api.tLogID)
-	resp, err := server.getLeaf(byteLeaf, api.tLogID)
+	server := serverInstance(api.clients.LogClient, api.clients.TLogID)
+	resp, err := server.getLeaf(byteLeaf, api.clients.TLogID)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	logging.Logger.Infof("Server PUT Response: %s", resp.status)
 	fmt.Fprintf(w, "Server PUT Response: %s\n", resp.status)
+}
+
+func (api *API) lookupHandler(w http.ResponseWriter, r *http.Request) {
+	hash := r.URL.Query().Get("hash")
+	hashBytes, err := hex.DecodeString(hash)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	response, err := api.clients.MapClient.GetLeaf(r.Context(), &trillian.GetMapLeafRequest{
+		MapId: api.clients.TMapID,
+		Index: hashBytes,
+	})
+
+	logIndex, err := strconv.ParseInt(string(response.MapLeafInclusion.Leaf.LeafValue), 10, 64)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	// Lookup the value from the log now at that index.
+	resp, err := api.clients.LogClient.GetLeavesByIndex(r.Context(), &trillian.GetLeavesByIndexRequest{
+		LogId:     api.clients.TLogID,
+		LeafIndex: []int64{logIndex},
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	for _, l := range resp.Leaves {
+		fmt.Fprintf(w, "----\n%s\n", string(l.LeafValue))
+	}
+	return
 }
 
 func (api *API) addHandler(w http.ResponseWriter, r *http.Request) {
@@ -137,9 +134,9 @@ func (api *API) addHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	server := serverInstance(api.logClient, api.tLogID)
+	server := serverInstance(api.clients.LogClient, api.clients.TLogID)
 
-	resp, err := server.addLeaf(byteLeaf, api.tLogID)
+	resp, err := server.addLeaf(byteLeaf, api.clients.TLogID)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -161,6 +158,7 @@ func New() (*chi.Mux, error) {
 	router.Post("/api/v1/add", api.addHandler)
 	router.Post("/api/v1/get", api.getHandler)
 	router.Get("/api/v1//ping", api.ping)
+	router.Get("/api/v1/lookup", api.lookupHandler)
 	return router, nil
 }
 
